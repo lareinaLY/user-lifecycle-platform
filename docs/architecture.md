@@ -116,26 +116,121 @@ Documented for rigor; contains no business figures:
   depth, independent of currency conversion and of any (possibly missing)
   renewal counter.
 
-## Point-in-time features & leakage avoidance (design)
+### Two-stage vs a single ZILN model — design trade-off
+A more advanced alternative is a single **zero-inflated lognormal (ZILN)**
+model that predicts conversion and value jointly, roughly halving model
+complexity versus two separate stages. We still choose two stages here,
+deliberately:
+- The target is **discrete value tiering**, not precise revenue
+  regression, so ZILN's main advantage (a calibrated continuous amount) is
+  not needed — and the two-stage approach's main weakness (treating
+  conversion and value as independent) has limited impact on *tier*
+  assignment.
+- ZILN is typically fit with a **neural network**, which conflicts with
+  this project's deliberate *"tabular data → tree models"* choice.
+- Two separate tree models are **more interpretable** (clean SHAP per
+  stage).
 
-Scoring happens **before** conversion. A correct training sample must
-therefore pair *features as they were known at a given point in time*
-with a *label observed strictly after that point*. Using features as of
-the conversion moment would leak future information into the model.
+Positioning: an informed trade-off — aware of the more advanced method,
+choosing the one that fits the data and objective — not a capability gap.
 
-**Designed approach:**
-- A training sample = a **feature snapshot at a historical point in time**
-  + the conversion label observed in a window *after* that timestamp.
-- The feature pipeline emits **timestamped feature snapshots** so the
-  feature state at any point in time can be reproduced.
-- Hard rule: when constructing a training sample, the feature timestamp
-  must precede the label observation window.
+## Churn label design — voluntary vs involuntary (design)
 
-This adopts the feature/label point-in-time alignment practice common in
-production recommendation and ad-ranking systems. The current
-`FeaturePipeline` exposes a `reference_date` cutoff in its config (the
-leakage-safe intent), but the snapshot machinery itself is **not yet
-built**.
+Churn is not a single label. Two mechanisms with opposite remedies must be
+modeled separately:
+- **Voluntary churn** — engagement decays and the user chooses to stop.
+  The lever is experience/value improvement.
+- **Involuntary churn** — the subscription lapses because a **payment
+  fails**, not because the user decided to leave. The lever is payment
+  recovery and proactive pre-expiry reminders.
+
+**Identifying involuntary churn** relies on generic payment-failure
+signals — renewal-payment failure, billing retries, and grace-period
+states surfaced by billing webhooks (described generically; no concrete
+status values or vendor terms appear here).
+
+**Design principle.** The two churn types must carry **separate labels and
+separate interventions**. Folding involuntary (payment-failed) users into a
+voluntary-churn label pollutes the "why did they leave" signal and
+mis-trains the model — a user whose card simply expired is not a
+dissatisfied user.
+
+*Not implemented; no churn model exists in the skeleton yet.*
+
+## Output design — user health score (design)
+
+A churn model's raw output is a probability, which is hard for operations
+teams to act on directly. The design wraps it into a **user health score**
+on a 0–100 scale that integrates multiple signals — engagement
+persistence, breadth of scenarios used, and investment/usage trend — into
+one interpretable number. Scores below a threshold trigger **tiered
+intervention**.
+
+This mirrors the **HubSpot Customer Health Score** pattern: a single,
+operations-friendly indicator rather than a bare model probability.
+
+*Design only; no health-score logic exists yet.*
+
+## Feature correctness I — point-in-time correctness (design)
+
+Scoring happens **before** conversion, so a correct training sample must
+pair *features as they were known at a point in time* with a *label
+observed strictly after that point*. Using features as of the conversion
+moment leaks future information — the failure mode the industry calls a
+violation of **point-in-time correctness** (a.k.a. *time-travel* or an
+*"as-of" join*).
+
+**Why it matters.** Feature leakage inflates offline metrics while the
+model collapses in production, because the leaked signal is not available
+at serving time. Published industry write-ups on point-in-time correctness
+report offline-vs-online gaps on the order of **5–20 percentage points**
+from this class of leakage — large enough to invalidate a launch decision.
+(Figure cited from external industry sources, not from this project's data.)
+
+**Designed approach — store events, recompute "as of".** A naive design
+would snapshot the full feature vector at every point in time, which blows
+up storage. Instead:
+- Persist **timestamped raw feature events**, not materialized snapshots.
+- To get features "as of" a sample timestamp, **recompute** window
+  aggregations over events with `event_timestamp <= sample_timestamp`.
+  Example: a 7-day rolling count is the count in the window *ending at the
+  sample timestamp*, never "up to now".
+- Hard rule: in a training sample, every feature's `event_timestamp` must
+  be `<=` the sample timestamp, which in turn must precede the label
+  observation window.
+
+This is the **as-of** approach used by production feature platforms
+(Airbnb's Zipline, Hopsworks), and it maps directly onto this project's
+dual-stream design: the **feature stream** is exactly the timestamped
+feature-event log the recompute reads from. The split also mirrors Feast's
+`get_historical_features` (point-in-time-correct joins for training) vs
+`get_online_features` (latest values for serving).
+
+The current `FeaturePipeline` exposes a `reference_date` cutoff in its
+config (the leakage-safe intent), but the as-of recompute machinery itself
+is **not yet built**.
+
+## Feature correctness II — training/serving consistency (design)
+
+Point-in-time correctness prevents leakage *within* the training set; it
+does not by itself guarantee that training and serving compute features
+the same way. If batch training and real-time scoring build features
+through **different code paths**, the two definitions drift apart — a
+**training/serving skew** that shifts the serving feature distribution away
+from what the model learned, degrading performance even when no single
+feature leaks.
+
+**Design principle.** Batch training and real-time scoring **share one
+feature-transform definition behind a single interface** — the same
+transformation code produces both the training matrix and the online
+feature vector. No parallel re-implementation of "the same" feature.
+
+Together these are the two feature-correctness guarantees the design
+commits to:
+- **Point-in-time correctness** — no feature observed after its label
+  (prevents leakage).
+- **Training/serving consistency** — one shared transform for both paths
+  (prevents skew).
 
 ## Event interfaces: dual-stream design (design)
 
@@ -211,11 +306,47 @@ Not implemented; records the intended training-time decisions.
   explicitly via negative-sample downsampling of the majority
   (low-activity non-payers) and/or LightGBM `scale_pos_weight`.
 
+## Intervention optimization layer — uplift modeling (extension)
+
+> **Status: reserved design direction — not implemented.** This layer is
+> absent from the skeleton; it records where the architecture is headed.
+
+The prediction layer (churn / LTV) answers *who* will churn or *who* is
+high-value. It does **not** answer *whom to treat*: spending retention
+budget on a user who would have stayed anyway is wasted, and some users
+react **negatively** to intervention. That question belongs to an
+**intervention optimization layer** built on **uplift modeling**, which
+estimates the *incremental* effect of an intervention per user:
+
+- **Persuadables** — stay only if treated. *The only segment worth
+  spending on.*
+- **Sure Things** — stay regardless; treating them wastes budget.
+- **Lost Causes** — churn regardless; treating them wastes budget.
+- **Sleeping Dogs** — treatment *causes* them to churn; must not be treated.
+
+**Hard constraint — needs experimental data.** Uplift models must be
+trained on **randomized controlled (A/B) data**, because an incremental
+effect is only identifiable from a treated-vs-control comparison. This
+closes the loop with this project's **experiment layer**: A/B tests are not
+only for validating a strategy — their assignment/outcome data is the
+training set for uplift.
+
+**Tooling.** This would build on **Uber's CausalML** rather than
+implementing uplift estimators from scratch.
+
+Design philosophy: *the endpoint of prediction is a decision; decisions
+should be judged on incremental effect; incremental effect comes from
+causal experiments.*
+
 ## Key design decisions
 
 1. **Interface-first, implementation-swappable.** Storage, registry, and
    event bus are abstract; local implementations support development and the
-   same interfaces back production services.
+   same interfaces back production services. Concretely, the interfaces are
+   aligned to production standards — the feature-store interface to the
+   **Feast** API (planned `LocalFeatureStore`) and the model registry to
+   **MLflow** (`LocalModelRegistry`) — so a POC-local backend can be swapped
+   for the production system without changing callers.
 2. **Leakage-safe features by construction.** The feature pipeline enforces a
    reference-time cutoff so training and serving see consistent, non-leaking
    features.

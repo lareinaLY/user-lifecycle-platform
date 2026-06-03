@@ -50,12 +50,27 @@ these are not yet implemented):
 
 - **Two-stage modeling** — a clean binary propensity baseline, then a
   value-aware tiering stage that uses *subscription duration* as the value
-  signal to sidestep multi-currency conversion.
-- **Point-in-time correctness** — timestamped feature snapshots pair
-  features-as-known with labels-observed-later, preventing feature leakage.
+  signal to sidestep multi-currency conversion. (Aware of single-model
+  ZILN alternatives; two-stage chosen for tabular/tree fit and
+  interpretability.)
+- **Point-in-time correctness** — an "as-of" join over timestamped feature
+  *events* (not stored snapshots) pairs features-as-known with
+  labels-observed-later, preventing leakage; aligned to the Feast
+  historical-vs-online split.
+- **Training/serving consistency** — one shared feature-transform
+  definition for both batch training and real-time scoring, avoiding
+  training/serving skew.
 - **Dual-stream, batch/streaming-ready** — separate feature and label
   streams joined by user + point in time; batch-first today, streaming
   training reserved as an extension with no data-path rewrite.
+- **Voluntary vs involuntary churn** — payment-failure ("involuntary")
+  churn is labeled and treated separately from engagement-driven
+  ("voluntary") churn.
+- **User health score** — churn risk surfaced as an operations-friendly
+  0–100 score that triggers tiered intervention.
+- **Uplift / intervention optimization (extension)** — a reserved layer
+  that targets *persuadable* users using A/B data, so experiments also
+  train causal uplift models.
 
 ## Tech Stack
 
