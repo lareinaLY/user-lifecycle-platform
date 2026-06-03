@@ -1,0 +1,32 @@
+# 数据文件
+data/*
+!data/.gitkeep
+*.parquet
+*.csv
+*.pkl
+
+# 环境
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 模型产物（仅根目录的产物目录，勿匹配 src/models/ 源码）
+/models/
+*.joblib
+
+# notebook
+notebooks/*
+!notebooks/.gitkeep
+.ipynb_checkpoints/
+
+# 测试缓存
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
