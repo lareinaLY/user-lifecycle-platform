@@ -12,38 +12,65 @@
 > - **(implemented)** — code that runs today.
 > - **(design)** — a decided design not yet built.
 > - **(extension)** — a reserved direction, intentionally out of scope for now.
+>
+> The build sequence for turning these designs into working software is in
+> [Roadmap](ROADMAP.md) (five planned phases; Phase 1 is next up).
 
 ## Overview
 
-The platform is organized into four loosely coupled layers. Each layer
-depends only on the abstract interfaces of the layer below it, which keeps
-components independently testable and lets backing implementations
-(storage, registry, event bus) be swapped between local development and
-production without touching upstream code.
+At runtime the system is **two independent pipelines that share nothing
+except the model artifact**. Describing it as a single top-to-bottom "layer
+stack" is inaccurate: the real-time request path and the offline training
+path run on different triggers and different latencies, and they touch each
+other **only** through the model **Registry**.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Experiment Layer   src/experiments/                          │
-│  A/B assignment (hash-based) · significance testing           │
-└───────────────▲─────────────────────────────────────────────┘
-                │ consumes scores
-┌───────────────┴─────────────────────────────────────────────┐
-│  Serving Layer      src/api/  ·  src/events/                  │
-│  FastAPI scoring (real-time + batch) · event production       │
-└───────────────▲─────────────────────────────────────────────┘
-                │ loads model versions
-┌───────────────┴─────────────────────────────────────────────┐
-│  Model Layer        src/models/                               │
-│  LightGBM propensity · LR baseline · model registry           │
-└───────────────▲─────────────────────────────────────────────┘
-                │ consumes feature matrices
-┌───────────────┴─────────────────────────────────────────────┐
-│  Data Layer         src/data/                                 │
-│  Parquet loaders (storage-agnostic) · feature pipeline        │
-└─────────────────────────────────────────────────────────────┘
-```
+> The four `src/` directories (data / models / api+events / experiments)
+> are a **source-tree code map**, not the runtime data flow. The runtime
+> shape is the two pipelines below. See
+> [Code modules](#code-modules-src) for the source map and
+> [Roadmap](ROADMAP.md) for the build order.
 
-## Layers
+### Real-time serving pipeline (on a user request)
+
+1. **A/B platform first — the most upstream entry.** The request enters the
+   A/B platform, which hash-buckets the user and resolves the **A/B
+   parameters** for this request. These parameters are the topmost input and
+   drive the entire path — in particular *which model / which version* this
+   request uses. A/B parameters are merged over the system defaults, with
+   **A/B parameters taking priority** on conflict. (A/B is the upstream that
+   decides how the request flows — *not* a downstream consumer of scores.)
+2. **Serving flow — model scoring is one step among several.** A
+   parameter-driven business flow runs. Model scoring is **a single link in
+   the chain**: there are pre-/post-scoring mechanisms around it such as
+   filtering and forced-insertion (business rules). The model is not the
+   whole serving layer. *(A POC may stub out filtering / forced-insertion,
+   but the architecture treats the model as one step, not the entirety.)*
+3. **Response** is returned.
+
+### Offline training pipeline (asynchronous; NOT on the request path)
+
+1. At prediction time, the features that fed the prediction are **dumped**
+   to a feature stream → **table A**.
+2. **Exposure + conversion** instrumentation is dumped to a label stream →
+   **table B**.
+3. **join(table A, table B) → samples → train model → push model to the
+   Registry.**
+
+### The single connection point
+
+The only coupling between the two pipelines is the model artifact:
+*offline training produces a model → **Registry** → the real-time pipeline
+loads it.* Nothing else links them directly. In particular, the model's use
+of **data-layer** features happens **offline, at training time** — the
+real-time path scores using the features already dumped at prediction time
+and does **not** reach back into the data layer mid-request (the
+model↔data relationship is offline/async, not a real-time serving
+dependency).
+
+## Code modules (`src/`)
+
+> Source-tree responsibilities. This is a code map; for the runtime data
+> flow see [Overview](#overview).
 
 ### Data layer (`src/data/`)
 - **`data_loader.py`** — `DataLoader` abstraction over the physical storage
@@ -71,14 +98,24 @@ The prediction target itself follows a two-stage design — see
 
 ### Serving layer (`src/api/`, `src/events/`)
 - **`api/scoring_service.py`** — FastAPI app exposing real-time and batch
-  scoring; loads a model version from the registry at startup.
+  scoring; loads a model version (selected by the request's A/B parameters)
+  from the registry. Model scoring is **one step** of the serving flow,
+  which also includes pre-/post-scoring mechanisms (filtering,
+  forced-insertion); the model is not the whole flow.
 - **`api/schemas.py`** — pydantic request/response contracts.
 - **`events/event_producer.py`** — Kafka-compatible `EventProducer`
   interface with an in-memory mock; production backs it with a real broker.
+  In the offline pipeline it carries the feature dump and the
+  exposure/conversion instrumentation (see
+  [Event interfaces](#event-interfaces-dual-stream-design-design)).
 
 ### Experiment layer (`src/experiments/`)
 - **`ab_test.py`** — deterministic, hash-based variant assignment (stateless
-  and reproducible) plus two-proportion significance testing.
+  and reproducible) plus significance testing. Assignment is the **upstream
+  entry** of a request: it resolves the A/B parameters that route the
+  request (including which model/version to use), and those parameters take
+  priority over system defaults. It is *not* a downstream consumer of
+  scores.
 
 ## Prediction target (design)
 
@@ -174,7 +211,7 @@ operations-friendly indicator rather than a bare model probability.
 ## Feature correctness I — point-in-time correctness (design)
 
 Scoring happens **before** conversion, so a correct training sample must
-pair *features as they were known at a point in time* with a *label
+pair *features as they were known at prediction time* with a *label
 observed strictly after that point*. Using features as of the conversion
 moment leaks future information — the failure mode the industry calls a
 violation of **point-in-time correctness** (a.k.a. *time-travel* or an
@@ -187,28 +224,33 @@ report offline-vs-online gaps on the order of **5–20 percentage points**
 from this class of leakage — large enough to invalidate a launch decision.
 (Figure cited from external industry sources, not from this project's data.)
 
-**Designed approach — store events, recompute "as of".** A naive design
-would snapshot the full feature vector at every point in time, which blows
-up storage. Instead:
-- Persist **timestamped raw feature events**, not materialized snapshots.
-- To get features "as of" a sample timestamp, **recompute** window
-  aggregations over events with `event_timestamp <= sample_timestamp`.
-  Example: a 7-day rolling count is the count in the window *ending at the
-  sample timestamp*, never "up to now".
-- Hard rule: in a training sample, every feature's `event_timestamp` must
-  be `<=` the sample timestamp, which in turn must precede the label
-  observation window.
+**Chosen approach — log features at prediction time.** Rather than
+reconstruct history after the fact, the system **dumps the exact features
+that fed each prediction, at the moment of prediction**, to the feature
+stream → table A. Because what is stored *is* "the features as of the
+prediction instant," it is point-in-time-correct **by construction** — it
+cannot contain future information. This is *prediction-time feature
+logging*, the technique production ranking systems use to guarantee
+correctness without a separate time-travel join.
 
-This is the **as-of** approach used by production feature platforms
-(Airbnb's Zipline, Hopsworks), and it maps directly onto this project's
-dual-stream design: the **feature stream** is exactly the timestamped
-feature-event log the recompute reads from. The split also mirrors Feast's
-`get_historical_features` (point-in-time-correct joins for training) vs
-`get_online_features` (latest values for serving).
+**Bonus — this also closes training/serving skew.** Because the training
+features are the *same* values dumped at serving time, the model trains on
+exactly what serving produced. A single mechanism therefore solves **both**
+point-in-time correctness *and* training/serving skew (see
+[Feature correctness II](#feature-correctness-ii--trainingserving-consistency-design)).
+
+**Alternative — as-of recompute (for historical backfill).** Where no
+prediction-time log exists yet, features can instead be reconstructed by an
+**as-of recompute** over timestamped raw events
+(`event_timestamp <= sample_timestamp`) — the approach used by feature
+platforms such as Airbnb's Zipline and Hopsworks, mirrored by Feast's
+`get_historical_features` (training) vs `get_online_features` (serving). The
+prediction-time dump is preferred when available: no recompute, and
+skew-free.
 
 The current `FeaturePipeline` exposes a `reference_date` cutoff in its
-config (the leakage-safe intent), but the as-of recompute machinery itself
-is **not yet built**.
+config (the leakage-safe intent), but the prediction-time dump and the
+join-to-samples machinery are **not yet built**.
 
 ## Feature correctness II — training/serving consistency (design)
 
@@ -234,60 +276,48 @@ commits to:
 
 ## Event interfaces: dual-stream design (design)
 
-The event interface upgrades from a single producer stream to a
-**two-stream** design that separates features from labels:
+Two streams feed the offline training pipeline, separating features from
+labels; both are Kafka topics that land in tables:
 
-- **Feature stream** — at scoring-request time, persist the feature
-  snapshot as of that moment.
-- **Label stream** — when a conversion event (payment instrumentation)
-  fires, persist the label.
-- **Join** — the two streams are aligned by **user + point in time** into
-  a single training-sample stream.
+- **Feature stream → table A** — at prediction time, dump the exact
+  features that fed the prediction (see
+  [Feature correctness I](#feature-correctness-i--point-in-time-correctness-design)).
+- **Label stream → table B** — labels are emitted as **two distinct
+  instrumentation events**:
+  - **Exposure event** — fired when the user is *shown* the paid anchor.
+  - **Conversion event** — fired if the user then pays / clicks.
+  - **Why two events:** the exposure event defines the **negative-sample
+    boundary**. Only users who were *exposed but did not convert* count as
+    negatives; users who were *never exposed* are excluded from the sample
+    set. This keeps false negatives out of training — a user who never saw
+    the offer is not a genuine "did not convert."
+- **Join** — table A and table B are joined by **user + point in time**
+  into the training samples, which feed batch (or streaming) training.
 
 Interfaces are designed to map directly onto a real Kafka deployment. The
 current code ships a **single-stream**, in-memory `MockEventProducer`
-(`send` / `flush`); the dual-stream split and the join are **design, not
-implemented**. Per the dependency-inversion principle, swapping the mock
-for a real broker leaves callers unchanged.
+(`send` / `flush`); the dual-stream split, the exposure/conversion labels,
+and the join are **design, not implemented**. Per the dependency-inversion
+principle, swapping the mock for a real broker leaves callers unchanged.
 
 ## Batch-first, streaming-ready (design)
 
 **Current main path — batch training.** Subscription conversion is a
-day-scale decision, not a second-scale interest shift, so batch training
-is more than sufficient on timeliness while staying cost-efficient and
-maintainable. Established users are scored in a daily batch; brand-new
-users are scored in real time on the registration event.
+day-scale decision, not a second-scale interest shift, so batch training is
+more than sufficient on timeliness while staying cost-efficient and
+maintainable. The flow is the offline pipeline from the
+[Overview](#overview): prediction-time feature dump → table A,
+exposure/conversion instrumentation → table B, join → samples → batch
+training → model pushed to the Registry. Established users are scored in a
+daily batch; brand-new users are scored in real time on the registration
+event.
 
-```
-Batch main path (design)
-┌────────────┐   daily   ┌──────────────┐   ┌───────────┐   ┌───────────┐
-│ raw events │ ───────▶  │ feature      │ ▶ │ batch     │ ▶ │ model     │
-│ (parquet)  │  refresh  │ snapshots    │   │ training  │   │ registry  │
-└────────────┘           └──────────────┘   └───────────┘   └─────┬─────┘
-                                                                   │
-   established users → daily batch scoring  ◀──────────────────────┤
-   new users (<48h)  → real-time scoring on registration event ◀───┘
-```
-
-**Extension path — streaming training (reserved, not built).** The
-separation of feature and label streams already positions the system for
-streaming training. If near-real-time updates are ever required, the
-sample stream can feed a streaming trainer **without re-architecting the
-data path**.
-
-```
-Streaming extension (reserved)
-┌──────────────┐     ┌──────────────┐
-│ feature      │     │ label        │
-│ stream       │     │ stream       │
-└──────┬───────┘     └──────┬───────┘
-       └────── join (user + point in time) ──────┐
-                                                  ▼
-                                       ┌────────────────────┐
-                                       │ streaming training  │
-                                       │ / online update     │
-                                       └────────────────────┘
-```
+**Extension path — streaming training (reserved, not built).** Separating
+the feature and label streams already positions the system for streaming
+training: if near-real-time updates are ever required, the joined sample
+stream can feed a streaming trainer **without re-architecting the data
+path** — the same two streams and the same join, consumed continuously
+rather than in a daily batch.
 
 ## Training strategy (design)
 
@@ -354,6 +384,12 @@ causal experiments.*
    the incremental value of the GBM and guards against pipeline regressions.
 4. **Explainability as a first-class output.** SHAP contributions are part of
    the scoring response to support targeted lifecycle interventions.
+5. **Progressive build — pipe first, fill later.** The real-time path is
+   brought up end-to-end with a **fake (random-scoring) model** before any
+   real model exists: *A/B parameters load → those parameters route to a
+   model (fake at first) → swap in the real model last.* Each step is
+   independently testable, so no milestone blocks on a downstream piece. The
+   phased milestones are in [Roadmap](ROADMAP.md).
 
 ## Data privacy
 

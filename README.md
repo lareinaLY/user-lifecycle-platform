@@ -144,8 +144,10 @@ uvicorn src.api.scoring_service:app --reload
 
 The rationale behind the layering, interface-first design, leakage-safe
 features, and explainability choices is documented in
-[`docs/architecture.md`](docs/architecture.md). The HTTP API contract is
-specified in [`docs/api_spec.md`](docs/api_spec.md).
+[`docs/architecture.md`](docs/architecture.md). The phased build plan
+(skeleton-with-fake-model first, then fill in real components) is in
+[`docs/ROADMAP.md`](docs/ROADMAP.md). The HTTP API contract is specified in
+[`docs/api_spec.md`](docs/api_spec.md).
 
 ## Limitations
 
